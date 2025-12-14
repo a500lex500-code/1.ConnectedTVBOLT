@@ -1,31 +1,46 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { toBlobURL } from '@ffmpeg/util';
 import { ScrapedData, AdScript } from '../types';
 
-const FPS = 30;
-const WIDTH = 1920;
-const HEIGHT = 1080;
+const FPS = 24;
+const WIDTH = 1280;
+const HEIGHT = 720;
 const VIDEO_DURATION = 30;
+const MAX_FRAMES = FPS * VIDEO_DURATION;
 
 let ffmpegInstance: FFmpeg | null = null;
+let ffmpegLoading: Promise<FFmpeg> | null = null;
 
 async function loadFFmpeg(onProgress: (progress: number) => void): Promise<FFmpeg> {
-  if (ffmpegInstance) return ffmpegInstance;
+  if (ffmpegInstance?.isLoaded()) return ffmpegInstance;
+  if (ffmpegLoading) return ffmpegLoading;
 
-  const ffmpeg = new FFmpeg();
+  ffmpegLoading = (async () => {
+    try {
+      const ffmpeg = new FFmpeg();
 
-  ffmpeg.on('progress', ({ progress }) => {
-    onProgress(progress);
-  });
+      ffmpeg.on('progress', ({ progress }) => {
+        onProgress(Math.min(0.95, progress));
+      });
 
-  const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-  });
+      const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
 
-  ffmpegInstance = ffmpeg;
-  return ffmpeg;
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, 'text/javascript'),
+      });
+
+      ffmpegInstance = ffmpeg;
+      ffmpegLoading = null;
+      return ffmpeg;
+    } catch (error) {
+      ffmpegLoading = null;
+      throw new Error(`FFmpeg load failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  })();
+
+  return ffmpegLoading;
 }
 
 export async function generateVideo(
@@ -33,151 +48,222 @@ export async function generateVideo(
   script: AdScript,
   onProgress: (progress: number) => void
 ): Promise<Blob> {
-  onProgress(0);
+  try {
+    onProgress(0);
 
-  const ffmpeg = await loadFFmpeg((p) => onProgress(p * 0.1));
-  onProgress(0.1);
+    const ffmpeg = await loadFFmpeg((p) => onProgress(Math.min(0.15, p * 0.15)));
+    onProgress(0.15);
 
-  const audioBuffers = await generateAudioSegments(script, (p) => onProgress(0.1 + p * 0.2));
-  onProgress(0.3);
+    const audioBlob = await generateAudio(script, (p) => onProgress(0.15 + p * 0.15));
+    onProgress(0.30);
 
-  const frames = await generateFrames(data, script, audioBuffers, (p) => onProgress(0.3 + p * 0.4));
-  onProgress(0.7);
+    const frameData = await generateFrames(data, script, (p) => onProgress(0.30 + p * 0.55));
+    onProgress(0.85);
 
-  const videoBlob = await encodeVideo(ffmpeg, frames, audioBuffers, (p) => onProgress(0.7 + p * 0.3));
-  onProgress(1.0);
+    const videoBlob = await encodeVideo(ffmpeg, frameData, audioBlob, (p) => onProgress(0.85 + p * 0.15));
+    onProgress(1.0);
 
-  return videoBlob;
+    return videoBlob;
+  } catch (error) {
+    throw new Error(`Video generation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
 }
 
-async function generateAudioSegments(
+async function generateAudio(
   script: AdScript,
   onProgress: (progress: number) => void
-): Promise<AudioBuffer[]> {
-  const audioContext = new AudioContext();
-  const buffers: AudioBuffer[] = [];
+): Promise<Blob> {
+  const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+  const sampleRate = audioContext.sampleRate;
+  const totalDuration = Math.min(script.totalDuration, VIDEO_DURATION);
+  const totalSamples = Math.floor(sampleRate * totalDuration);
+
+  const audioBuffer = audioContext.createBuffer(2, totalSamples, sampleRate);
+  const leftChannel = audioBuffer.getChannelData(0);
+  const rightChannel = audioBuffer.getChannelData(1);
+
+  let currentSample = 0;
 
   for (let i = 0; i < script.segments.length; i++) {
     const segment = script.segments[i];
+    const segmentSamples = Math.floor(sampleRate * segment.duration);
+
     try {
-      const audioBuffer = await fetchTTS(segment.text, audioContext);
-      buffers.push(audioBuffer);
+      const audio = await generateSegmentAudio(segment.text, sampleRate);
+      const audioData = await audio.arrayBuffer();
+      const view = new Uint8Array(audioData);
+
+      let sampleIndex = 0;
+      for (let j = 0; j < Math.min(view.length, segmentSamples * 2); j += 2) {
+        if (currentSample >= totalSamples) break;
+
+        const sample = (view[j] | (view[j + 1] << 8)) / 32768.0;
+        leftChannel[currentSample] = sample;
+        rightChannel[currentSample] = sample;
+        currentSample++;
+        sampleIndex++;
+      }
     } catch (error) {
-      console.warn('TTS failed, using silence:', error);
-      const silenceBuffer = audioContext.createBuffer(2, audioContext.sampleRate * segment.duration, audioContext.sampleRate);
-      buffers.push(silenceBuffer);
+      console.warn(`TTS failed for segment ${i}, using silence`);
+      currentSample += segmentSamples;
     }
+
     onProgress((i + 1) / script.segments.length);
   }
 
-  return buffers;
+  return audioBufferToWav(audioBuffer);
 }
 
-async function fetchTTS(text: string, audioContext: AudioContext): Promise<AudioBuffer> {
-  const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q=${encodeURIComponent(text)}`;
+async function generateSegmentAudio(text: string, sampleRate: number): Promise<Blob> {
+  const cleanText = text.substring(0, 200);
+  const urls = [
+    `https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM?text=${encodeURIComponent(cleanText)}`,
+    `https://tts.api.cloud.yandex.net/tts?text=${encodeURIComponent(cleanText)}&lang=en-US`,
+    `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q=${encodeURIComponent(cleanText)}`,
+  ];
 
-  const response = await fetch(ttsUrl);
-  if (!response.ok) throw new Error('TTS fetch failed');
+  for (const url of urls) {
+    try {
+      const response = await Promise.race([
+        fetch(url),
+        new Promise<Response>((_, reject) =>
+          setTimeout(() => reject(new Error('TTS timeout')), 5000)
+        ),
+      ]);
 
-  const arrayBuffer = await response.arrayBuffer();
-  return await audioContext.decodeAudioData(arrayBuffer);
+      if (response.ok) {
+        return await response.blob();
+      }
+    } catch (error) {
+      console.warn(`TTS endpoint failed: ${url}`);
+      continue;
+    }
+  }
+
+  return new Blob([new Uint8Array(0)], { type: 'audio/wav' });
 }
 
 async function generateFrames(
   data: ScrapedData,
   script: AdScript,
-  audioBuffers: AudioBuffer[],
   onProgress: (progress: number) => void
-): Promise<ImageData[]> {
+): Promise<Uint8ClampedArray[]> {
   const canvas = new OffscreenCanvas(WIDTH, HEIGHT);
   const ctx = canvas.getContext('2d')!;
-  const frames: ImageData[] = [];
+  const frameArrays: Uint8ClampedArray[] = [];
 
   const images = await loadImages(data.images);
+  if (images.length === 0) {
+    console.warn('No images loaded, using solid color');
+  }
 
-  let currentTime = 0;
-  let segmentIndex = 0;
-  let segmentStartTime = 0;
+  let currentSegmentIndex = 0;
+  let currentSegmentStartFrame = 0;
 
-  const totalFrames = FPS * VIDEO_DURATION;
+  for (let frameNum = 0; frameNum < MAX_FRAMES; frameNum++) {
+    let segment = script.segments[0];
+    let imageIndex = 0;
 
-  for (let frameNum = 0; frameNum < totalFrames; frameNum++) {
-    currentTime = frameNum / FPS;
-
-    while (segmentIndex < script.segments.length && currentTime >= segmentStartTime + script.segments[segmentIndex].duration) {
-      segmentStartTime += script.segments[segmentIndex].duration;
-      segmentIndex++;
+    let frameInSegment = frameNum - currentSegmentStartFrame;
+    while (
+      currentSegmentIndex < script.segments.length &&
+      frameInSegment >= script.segments[currentSegmentIndex].duration * FPS
+    ) {
+      frameInSegment -= script.segments[currentSegmentIndex].duration * FPS;
+      currentSegmentStartFrame += script.segments[currentSegmentIndex].duration * FPS;
+      currentSegmentIndex++;
     }
 
-    if (segmentIndex >= script.segments.length) {
-      segmentIndex = script.segments.length - 1;
+    if (currentSegmentIndex < script.segments.length) {
+      segment = script.segments[currentSegmentIndex];
+      imageIndex = currentSegmentIndex % Math.max(1, images.length);
     }
 
-    const segment = script.segments[segmentIndex];
-    const imageIndex = segmentIndex % images.length;
-
-    ctx.fillStyle = data.primaryColor;
+    ctx.fillStyle = data.primaryColor || '#3b82f6';
     ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-    if (images[imageIndex]) {
-      const img = images[imageIndex];
-      const scale = Math.max(WIDTH / img.width, HEIGHT / img.height);
-      const scaledWidth = img.width * scale;
-      const scaledHeight = img.height * scale;
-      const x = (WIDTH - scaledWidth) / 2;
-      const y = (HEIGHT - scaledHeight) / 2;
+    if (images.length > imageIndex) {
+      try {
+        const img = images[imageIndex];
+        const scale = Math.max(WIDTH / img.width, HEIGHT / img.height);
+        const scaledWidth = img.width * scale;
+        const scaledHeight = img.height * scale;
+        const x = (WIDTH - scaledWidth) / 2;
+        const y = (HEIGHT - scaledHeight) / 2;
 
-      ctx.globalAlpha = 0.4;
-      ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
-      ctx.globalAlpha = 1.0;
+        ctx.globalAlpha = 0.5;
+        ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
+        ctx.globalAlpha = 1.0;
+      } catch (error) {
+        console.warn('Image draw failed');
+      }
     }
 
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-    ctx.fillRect(0, HEIGHT - 250, WIDTH, 250);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, HEIGHT - 200, WIDTH, 200);
 
     ctx.fillStyle = 'white';
-    ctx.font = 'bold 64px Arial, sans-serif';
+    ctx.font = 'bold 48px Arial, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+    ctx.shadowBlur = 4;
 
-    const lines = wrapText(ctx, segment.text, WIDTH - 100);
-    const lineHeight = 80;
-    const startY = HEIGHT - 125 - ((lines.length - 1) * lineHeight) / 2;
+    const lines = wrapText(ctx, segment.text, WIDTH - 40);
+    const lineHeight = 56;
+    const startY = HEIGHT - 100 - ((lines.length - 1) * lineHeight) / 2;
 
     lines.forEach((line, i) => {
-      ctx.fillText(line, WIDTH / 2, startY + i * lineHeight);
+      ctx.fillText(line, WIDTH / 2, Math.max(50, startY + i * lineHeight));
     });
 
     const imageData = ctx.getImageData(0, 0, WIDTH, HEIGHT);
-    frames.push(imageData);
+    frameArrays.push(imageData.data);
 
-    if (frameNum % 30 === 0) {
-      onProgress(frameNum / totalFrames);
+    if (frameNum % 24 === 0) {
+      onProgress(frameNum / MAX_FRAMES);
     }
   }
 
   onProgress(1.0);
-  return frames;
+  return frameArrays;
 }
 
 async function loadImages(imageUrls: string[]): Promise<HTMLImageElement[]> {
-  const promises = imageUrls.map(async (url) => {
+  const loadPromises = imageUrls.slice(0, 8).map(async (url) => {
     try {
       const img = new Image();
       img.crossOrigin = 'anonymous';
-      await new Promise((resolve, reject) => {
-        img.onload = resolve;
-        img.onerror = reject;
+      img.loading = 'eager';
+
+      const loadPromise = new Promise<HTMLImageElement>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Image load timeout')), 8000);
+
+        img.onload = () => {
+          clearTimeout(timeout);
+          resolve(img);
+        };
+
+        img.onerror = () => {
+          clearTimeout(timeout);
+          reject(new Error('Image load failed'));
+        };
+
         img.src = url;
       });
-      return img;
-    } catch {
+
+      return await loadPromise;
+    } catch (error) {
+      console.warn(`Failed to load image: ${url}`, error);
       return null;
     }
   });
 
-  const results = await Promise.all(promises);
-  return results.filter((img): img is HTMLImageElement => img !== null);
+  const results = await Promise.allSettled(loadPromises);
+  return results
+    .filter((r) => r.status === 'fulfilled' && r.value !== null)
+    .map((r) => (r as PromiseFulfilledResult<HTMLImageElement | null>).value!)
+    .filter((img): img is HTMLImageElement => img !== null);
 }
 
 function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
@@ -201,123 +287,102 @@ function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number)
     lines.push(currentLine);
   }
 
-  return lines;
+  return lines.slice(0, 3);
 }
 
 async function encodeVideo(
   ffmpeg: FFmpeg,
-  frames: ImageData[],
-  audioBuffers: AudioBuffer[],
+  frameArrays: Uint8ClampedArray[],
+  audioBlob: Blob,
   onProgress: (progress: number) => void
 ): Promise<Blob> {
-  onProgress(0);
+  try {
+    onProgress(0);
 
-  for (let i = 0; i < frames.length; i++) {
-    const imageData = frames[i];
-    const canvas = new OffscreenCanvas(WIDTH, HEIGHT);
-    const ctx = canvas.getContext('2d')!;
-    ctx.putImageData(imageData, 0, 0);
+    for (let i = 0; i < frameArrays.length; i++) {
+      const canvas = new OffscreenCanvas(WIDTH, HEIGHT);
+      const ctx = canvas.getContext('2d')!;
 
-    const blob = await canvas.convertToBlob({ type: 'image/png' });
-    const buffer = await blob.arrayBuffer();
-    const filename = `frame${String(i).padStart(4, '0')}.png`;
-    await ffmpeg.writeFile(filename, new Uint8Array(buffer));
+      const imageData = new ImageData(frameArrays[i], WIDTH, HEIGHT);
+      ctx.putImageData(imageData, 0, 0);
 
-    if (i % 30 === 0) {
-      onProgress(i / frames.length * 0.5);
-    }
-  }
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.8 });
+      const buffer = await blob.arrayBuffer();
+      const filename = `frame${String(i).padStart(5, '0')}.jpg`;
 
-  onProgress(0.5);
+      await ffmpeg.writeFile(filename, new Uint8Array(buffer));
 
-  const combinedAudio = await combineAudioBuffers(audioBuffers);
-  const audioBlob = await audioBufferToWav(combinedAudio);
-  const audioBuffer = await audioBlob.arrayBuffer();
-  await ffmpeg.writeFile('audio.wav', new Uint8Array(audioBuffer));
-
-  onProgress(0.6);
-
-  await ffmpeg.exec([
-    '-framerate', String(FPS),
-    '-i', 'frame%04d.png',
-    '-i', 'audio.wav',
-    '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac',
-    '-b:a', '192k',
-    '-shortest',
-    '-t', String(VIDEO_DURATION),
-    'output.mp4'
-  ]);
-
-  onProgress(0.9);
-
-  const data = await ffmpeg.readFile('output.mp4');
-  const videoBlob = new Blob([data], { type: 'video/mp4' });
-
-  onProgress(1.0);
-  return videoBlob;
-}
-
-function combineAudioBuffers(buffers: AudioBuffer[]): AudioBuffer {
-  if (buffers.length === 0) {
-    const audioContext = new AudioContext();
-    return audioContext.createBuffer(2, audioContext.sampleRate * VIDEO_DURATION, audioContext.sampleRate);
-  }
-
-  const sampleRate = buffers[0].sampleRate;
-  const totalLength = Math.min(
-    buffers.reduce((sum, buffer) => sum + buffer.length, 0),
-    sampleRate * VIDEO_DURATION
-  );
-
-  const audioContext = new AudioContext();
-  const combined = audioContext.createBuffer(2, totalLength, sampleRate);
-
-  let offset = 0;
-  for (const buffer of buffers) {
-    if (offset >= totalLength) break;
-
-    for (let channel = 0; channel < Math.min(2, buffer.numberOfChannels); channel++) {
-      const sourceData = buffer.getChannelData(channel);
-      const targetData = combined.getChannelData(channel);
-      const copyLength = Math.min(sourceData.length, totalLength - offset);
-
-      for (let i = 0; i < copyLength; i++) {
-        targetData[offset + i] = sourceData[i];
+      if (i % 12 === 0) {
+        onProgress(Math.min(0.6, (i / frameArrays.length) * 0.6));
       }
     }
-    offset += buffer.length;
-  }
 
-  return combined;
+    onProgress(0.65);
+
+    const audioBuffer = await audioBlob.arrayBuffer();
+    await ffmpeg.writeFile('audio.wav', new Uint8Array(audioBuffer));
+
+    onProgress(0.70);
+
+    const ffmpegArgs = [
+      '-framerate', String(FPS),
+      '-i', 'frame%05d.jpg',
+      '-i', 'audio.wav',
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'libmp3lame',
+      '-b:a', '128k',
+      '-shortest',
+      '-movflags', '+faststart',
+      'output.mp4',
+    ];
+
+    await ffmpeg.exec(ffmpegArgs);
+
+    onProgress(0.95);
+
+    const data = await ffmpeg.readFile('output.mp4');
+    const videoBlob = new Blob([data.buffer], { type: 'video/mp4' });
+
+    for (let i = 0; i < frameArrays.length; i++) {
+      const filename = `frame${String(i).padStart(5, '0')}.jpg`;
+      await ffmpeg.deleteFile(filename).catch(() => {});
+    }
+    await ffmpeg.deleteFile('audio.wav').catch(() => {});
+    await ffmpeg.deleteFile('output.mp4').catch(() => {});
+
+    onProgress(1.0);
+    return videoBlob;
+  } catch (error) {
+    throw new Error(`Video encoding failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
 }
 
-function audioBufferToWav(audioBuffer: AudioBuffer): Promise<Blob> {
+async function audioBufferToWav(audioBuffer: AudioBuffer): Promise<Blob> {
   const numberOfChannels = audioBuffer.numberOfChannels;
   const sampleRate = audioBuffer.sampleRate;
-  const format = 1;
   const bitDepth = 16;
-
   const bytesPerSample = bitDepth / 8;
   const blockAlign = numberOfChannels * bytesPerSample;
 
-  const data = new Float32Array(audioBuffer.length * numberOfChannels);
+  const audioData = new Float32Array(audioBuffer.length * numberOfChannels);
   for (let channel = 0; channel < numberOfChannels; channel++) {
     const channelData = audioBuffer.getChannelData(channel);
     for (let i = 0; i < audioBuffer.length; i++) {
-      data[i * numberOfChannels + channel] = channelData[i];
+      audioData[i * numberOfChannels + channel] = channelData[i];
     }
   }
 
-  const dataLength = data.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataLength);
-  const view = new DataView(buffer);
+  const dataLength = audioData.length * bytesPerSample;
+  const headerLength = 44;
+  const wavBuffer = new ArrayBuffer(headerLength + dataLength);
+  const view = new DataView(wavBuffer);
 
-  const writeString = (offset: number, string: string) => {
-    for (let i = 0; i < string.length; i++) {
-      view.setUint8(offset + i, string.charCodeAt(i));
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
     }
   };
 
@@ -326,7 +391,7 @@ function audioBufferToWav(audioBuffer: AudioBuffer): Promise<Blob> {
   writeString(8, 'WAVE');
   writeString(12, 'fmt ');
   view.setUint32(16, 16, true);
-  view.setUint16(20, format, true);
+  view.setUint16(20, 1, true);
   view.setUint16(22, numberOfChannels, true);
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * blockAlign, true);
@@ -335,13 +400,14 @@ function audioBufferToWav(audioBuffer: AudioBuffer): Promise<Blob> {
   writeString(36, 'data');
   view.setUint32(40, dataLength, true);
 
+  let index = headerLength;
   const volume = 0.8;
-  let offset = 44;
-  for (let i = 0; i < data.length; i++) {
-    const sample = Math.max(-1, Math.min(1, data[i]));
-    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF * volume, true);
-    offset += 2;
+
+  for (let i = 0; i < audioData.length; i++) {
+    const s = Math.max(-1, Math.min(1, audioData[i])) * volume;
+    view.setInt16(index, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    index += 2;
   }
 
-  return Promise.resolve(new Blob([buffer], { type: 'audio/wav' }));
+  return new Blob([wavBuffer], { type: 'audio/wav' });
 }
